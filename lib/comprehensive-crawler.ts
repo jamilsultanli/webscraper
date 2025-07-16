@@ -1,7 +1,4 @@
-import { neon } from "@neondatabase/serverless"
-
-// Initialize Neon client globally or pass it via constructor
-const sql = neon(process.env.DATABASE_URL!)
+import { getDbClient } from "@/lib/db" // Updated import
 
 interface CrawlConfig {
   maxPages: number
@@ -146,13 +143,17 @@ export class ComprehensiveCrawler {
     }
 
     try {
-      await sql`
+      const client = await getDbClient()
+      await client.query(
+        `
         INSERT INTO crawl_states (domain_name, state_data, last_saved_at)
-        VALUES (${domain}, ${JSON.stringify(state)}::jsonb, NOW())
+        VALUES ($1, $2::jsonb, NOW())
         ON CONFLICT (domain_name) DO UPDATE SET
           state_data = EXCLUDED.state_data,
           last_saved_at = NOW();
-      `
+      `,
+        [domain, JSON.stringify(state)],
+      )
       console.log(`Crawl state saved successfully for ${domain} to database.`)
     } catch (error) {
       console.error(`Failed to save crawl state for ${domain} to database:`, error)
@@ -161,15 +162,19 @@ export class ComprehensiveCrawler {
 
   private async loadState(domain: string): Promise<boolean> {
     try {
-      const result = await sql`
-        SELECT state_data FROM crawl_states WHERE domain_name = ${domain};
-      `
-      if (result.length === 0) {
+      const client = await getDbClient()
+      const result = await client.query(
+        `
+        SELECT state_data FROM crawl_states WHERE domain_name = $1;
+      `,
+        [domain],
+      )
+      if (result.rows.length === 0) {
         console.log(`No crawl state found for ${domain} in database.`)
         return false
       }
 
-      const state: CrawlState = result[0].state_data
+      const state: CrawlState = result.rows[0].state_data
 
       this.discoveredUrls = new Set(state.discoveredUrls)
       this.crawledUrls = new Set(state.crawledUrls)
@@ -294,7 +299,9 @@ export class ComprehensiveCrawler {
           } catch (error) {
             console.log(`Failed to parse nested sitemap: ${url} - ${error instanceof Error ? error.message : error}`) // Enhanced log
           }
-        } else {
+        }
+        // Only add if we haven't reached the maxPages limit for discovered URLs
+        else if (this.discoveredUrls.size < this.config.maxPages) {
           urls.push(url)
         }
       }

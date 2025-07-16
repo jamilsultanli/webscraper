@@ -1,6 +1,5 @@
 import { type NextRequest, NextResponse } from "next/server"
-import { neon } from "@neondatabase/serverless"
-const sql = neon(process.env.DATABASE_URL!)
+import { getDbClient } from "@/lib/db" // Updated import
 
 export async function GET(request: NextRequest, { params }: { params: { domain: string } }) {
   try {
@@ -12,12 +11,18 @@ export async function GET(request: NextRequest, { params }: { params: { domain: 
     const relType = searchParams.get("relType") || "all"
     const domainFilter = searchParams.get("domainFilter") || ""
 
+    const client = await getDbClient() // Get the database client
+
     // 1. Get domain_id from the domains table
-    const domainRecord = await sql`
+    const domainRecordResult = await client.query(
+      `
       SELECT id, domain_name, status, total_external_links, total_pages_crawled, crawl_depth, created_at, updated_at
       FROM domains
-      WHERE domain_name = ${domain};
-    `
+      WHERE domain_name = $1;
+    `,
+      [domain],
+    )
+    const domainRecord = domainRecordResult.rows
 
     if (domainRecord.length === 0) {
       return NextResponse.json({ error: "No results found for this domain. Please crawl first." }, { status: 404 })
@@ -27,46 +32,52 @@ export async function GET(request: NextRequest, { params }: { params: { domain: 
     const domainId = domainInfo.id
 
     // 2. Fetch all links for filtering and pagination
-    let query = sql`
+    let queryText = `
       SELECT source_url, target_url, target_domain, anchor_text, rel_type, is_nofollow, created_at
       FROM outgoing_links
-      WHERE domain_id = ${domainId}
+      WHERE domain_id = $1
     `
-
-    const queryParams: any[] = []
-    const paramIndex = 1
+    const queryParams: any[] = [domainId]
+    let paramIndex = 2
 
     if (filter) {
-      query = sql`${query} AND (
-        LOWER(target_url) LIKE LOWER(${`%${filter}%`}) OR
-        LOWER(anchor_text) LIKE LOWER(${`%${filter}%`}) OR
-        LOWER(target_domain) LIKE LOWER(${`%${filter}%`})
+      queryText += ` AND (
+        LOWER(target_url) LIKE LOWER($${paramIndex}) OR
+        LOWER(anchor_text) LIKE LOWER($${paramIndex}) OR
+        LOWER(target_domain) LIKE LOWER($${paramIndex})
       )`
+      queryParams.push(`%${filter}%`)
+      paramIndex++
     }
 
     if (relType !== "all") {
       if (relType === "nofollow") {
-        query = sql`${query} AND is_nofollow = TRUE`
+        queryText += ` AND is_nofollow = TRUE`
       } else if (relType === "dofollow") {
-        query = sql`${query} AND is_nofollow = FALSE`
+        queryText += ` AND is_nofollow = FALSE`
       }
     }
 
     if (domainFilter) {
-      query = sql`${query} AND target_domain = ${domainFilter}`
+      queryText += ` AND target_domain = $${paramIndex}`
+      queryParams.push(domainFilter)
+      paramIndex++
     }
 
-    const allLinksResult = await query
-    const allLinks = allLinksResult // allLinks is now the filtered set
+    const allLinksResult = await client.query(queryText, queryParams)
+    const allLinks = allLinksResult.rows // allLinks is now the filtered set
 
     // 3. Fetch domain summary
-    const domainSummaryResult = await sql`
+    const domainSummaryResult = await client.query(
+      `
       SELECT target_domain, link_count, first_seen_at, last_seen_at
       FROM outgoing_domains
-      WHERE domain_id = ${domainId}
+      WHERE domain_id = $1
       ORDER BY link_count DESC;
-    `
-    const domainSummary = domainSummaryResult
+    `,
+      [domainId],
+    )
+    const domainSummary = domainSummaryResult.rows
 
     // Pagination
     const offset = (page - 1) * limit
@@ -82,9 +93,6 @@ export async function GET(request: NextRequest, { params }: { params: { domain: 
         total_pages_crawled: domainInfo.total_pages_crawled,
         crawl_date: domainInfo.created_at, // Use created_at for initial crawl date
         crawl_depth: domainInfo.crawl_depth,
-        // crawl_config and sitemapsFound are not stored in 'domains' table,
-        // so they won't be available here unless added to the schema.
-        // For now, we'll omit them or set to default/null.
         crawl_config: null,
         sitemapsFound: 0,
       },

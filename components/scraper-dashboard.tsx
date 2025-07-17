@@ -11,7 +11,7 @@ import { Switch } from "@/components/ui/switch"
 import { Label } from "@/components/ui/label"
 import { PaginatedLinkTable } from "@/components/paginated-link-table"
 import { DomainSummary } from "@/components/domain-summary"
-import { Loader2, SearchIcon, AlertCircle, CheckCircle, Clock, Settings, Zap } from "lucide-react"
+import { Loader2, SearchIcon, AlertCircle, CheckCircle, Clock, Settings, Zap, Info } from "lucide-react"
 
 interface CrawlStatus {
   id: number
@@ -29,15 +29,68 @@ interface CrawlStatus {
 export function ScraperDashboard() {
   const [url, setUrl] = React.useState("https://en.wikipedia.org")
   const [depth, setDepth] = React.useState("3")
-  const [maxPages, setMaxPages] = React.useState("5000") // Increased default
-  const [concurrency, setConcurrency] = React.useState("5") // New state for concurrency
+  const [maxPages, setMaxPages] = React.useState("5000")
+  const [concurrency, setConcurrency] = React.useState("5")
   const [includeSubdomains, setIncludeSubdomains] = React.useState(true)
   const [followSitemaps, setFollowSitemaps] = React.useState(true)
   const [resumeCrawl, setResumeCrawl] = React.useState(false)
+
   const [loading, setLoading] = React.useState(false)
   const [error, setError] = React.useState<string | null>(null)
   const [crawlStatus, setCrawlStatus] = React.useState<CrawlStatus | null>(null)
   const [results, setResults] = React.useState<any>(null)
+
+  // New state for polling
+  const [isPolling, setIsPolling] = React.useState(false)
+  const [pollingDomain, setPollingDomain] = React.useState<string | null>(null)
+
+  // Effect to handle polling
+  React.useEffect(() => {
+    let intervalId: NodeJS.Timeout | null = null
+
+    if (isPolling && pollingDomain) {
+      intervalId = setInterval(async () => {
+        try {
+          const response = await fetch(`/api/crawl-status/${pollingDomain}`)
+          if (!response.ok) {
+            throw new Error("Failed to get crawl status")
+          }
+          const statusData = await response.json()
+
+          // Update UI with polled data
+          setCrawlStatus(statusData)
+
+          if (statusData.status === "completed" || statusData.status === "failed") {
+            setIsPolling(false)
+            setPollingDomain(null)
+            setLoading(false)
+            if (statusData.status === "completed") {
+              // Set final results to trigger table rendering
+              setResults({
+                domain: statusData,
+                totalLinks: statusData.total_external_links,
+                domainSummary: statusData.domainSummary || [], // Assuming status endpoint provides this
+              })
+            } else {
+              setError(`Crawl failed for ${pollingDomain}. Check server logs for details.`)
+            }
+          }
+        } catch (err) {
+          console.error("Polling error:", err)
+          setError("Failed to get crawl status.")
+          setIsPolling(false)
+          setPollingDomain(null)
+          setLoading(false)
+        }
+      }, 5000) // Poll every 5 seconds
+    }
+
+    return () => {
+      if (intervalId) {
+        clearInterval(intervalId)
+      }
+    }
+  }, [isPolling, pollingDomain])
 
   const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault()
@@ -45,10 +98,9 @@ export function ScraperDashboard() {
     setError(null)
     setCrawlStatus(null)
     setResults(null)
+    setPollingDomain(null)
 
     try {
-      console.log(`Frontend: Sending crawl request for: ${url}, resume: ${resumeCrawl}`)
-
       const response = await fetch("/api/crawl-website", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -56,7 +108,7 @@ export function ScraperDashboard() {
           url,
           depth: Number.parseInt(depth),
           maxPages: Number.parseInt(maxPages),
-          concurrency: Number.parseInt(concurrency), // Pass concurrency
+          concurrency: Number.parseInt(concurrency),
           includeSubdomains,
           followSitemaps,
           resume: resumeCrawl,
@@ -66,29 +118,26 @@ export function ScraperDashboard() {
       const data = await response.json()
 
       if (!response.ok) {
-        throw new Error(data.error || "Failed to crawl website")
+        throw new Error(data.error || "Failed to start crawl")
       }
 
-      console.log("Comprehensive crawl completed:", data)
-
-      // Set results
-      setResults(data)
+      // Crawl started successfully, begin polling
+      setPollingDomain(data.domain_name)
+      setIsPolling(true)
       setCrawlStatus({
-        id: 1, // Placeholder ID
-        domain_name: data.domain.domain_name,
-        status: "completed",
-        crawl_date: data.domain.crawl_date,
-        total_pages_crawled: data.domain.total_pages_crawled,
-        total_external_links: data.domain.total_external_links,
-        crawl_depth: data.domain.crawl_depth,
-        created_at: data.domain.crawl_date,
-        updated_at: data.domain.crawl_date,
-        crawl_config: data.domain.crawl_config,
+        id: 0,
+        domain_name: data.domain_name,
+        status: "processing",
+        crawl_date: new Date().toISOString(),
+        total_pages_crawled: 0,
+        total_external_links: 0,
+        crawl_depth: Number(depth),
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
       })
     } catch (err) {
-      console.error("Crawl error:", err)
+      console.error("Crawl initiation error:", err)
       setError(err instanceof Error ? err.message : "An error occurred")
-    } finally {
       setLoading(false)
     }
   }
@@ -101,6 +150,7 @@ export function ScraperDashboard() {
         return <AlertCircle className="h-4 w-4 text-red-600" />
       case "processing":
       case "crawling":
+      case "queued":
         return <Loader2 className="h-4 w-4 animate-spin text-blue-600" />
       default:
         return <Clock className="h-4 w-4 text-yellow-600" />
@@ -115,13 +165,13 @@ export function ScraperDashboard() {
         return "bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200"
       case "processing":
       case "crawling":
+      case "queued":
         return "bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200"
       default:
         return "bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200"
     }
   }
 
-  // Predefined example URLs for comprehensive crawling
   const exampleUrls = [
     "https://en.wikipedia.org",
     "https://www.bbc.com",
@@ -129,6 +179,8 @@ export function ScraperDashboard() {
     "https://www.reuters.com",
     "https://www.theguardian.com",
   ]
+
+  const isCrawling = loading || isPolling
 
   return (
     <div className="space-y-8">
@@ -155,11 +207,11 @@ export function ScraperDashboard() {
                   onChange={(e) => setUrl(e.target.value)}
                   className="pl-10"
                   required
-                  disabled={loading}
+                  disabled={isCrawling}
                 />
               </div>
-              <Button type="submit" disabled={loading} className="w-full sm:w-auto">
-                {loading ? (
+              <Button type="submit" disabled={isCrawling} className="w-full sm:w-auto">
+                {isCrawling ? (
                   <>
                     <Loader2 className="mr-2 h-4 w-4 animate-spin" />
                     Crawling...
@@ -173,13 +225,11 @@ export function ScraperDashboard() {
               </Button>
             </div>
 
-            {/* Advanced Configuration */}
             <div className="border rounded-lg p-4 space-y-4">
               <div className="flex items-center gap-2">
                 <Settings className="h-4 w-4" />
                 <h3 className="font-medium">Crawl Configuration</h3>
               </div>
-
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
                 <div>
                   <Label htmlFor="maxPages">Max Pages</Label>
@@ -189,14 +239,13 @@ export function ScraperDashboard() {
                     value={maxPages}
                     onChange={(e) => setMaxPages(e.target.value)}
                     min="1"
-                    disabled={loading}
+                    disabled={isCrawling}
                     placeholder="e.g., 5000"
                   />
                 </div>
-
                 <div>
                   <Label htmlFor="concurrency">Concurrency</Label>
-                  <Select value={concurrency} onValueChange={setConcurrency} disabled={loading}>
+                  <Select value={concurrency} onValueChange={setConcurrency} disabled={isCrawling}>
                     <SelectTrigger>
                       <SelectValue />
                     </SelectTrigger>
@@ -208,10 +257,9 @@ export function ScraperDashboard() {
                     </SelectContent>
                   </Select>
                 </div>
-
                 <div>
                   <Label htmlFor="depth">Crawl Depth</Label>
-                  <Select value={depth} onValueChange={setDepth} disabled={loading}>
+                  <Select value={depth} onValueChange={setDepth} disabled={isCrawling}>
                     <SelectTrigger>
                       <SelectValue />
                     </SelectTrigger>
@@ -223,36 +271,37 @@ export function ScraperDashboard() {
                     </SelectContent>
                   </Select>
                 </div>
-
                 <div className="flex items-center space-x-2">
                   <Switch
                     id="subdomains"
                     checked={includeSubdomains}
                     onCheckedChange={setIncludeSubdomains}
-                    disabled={loading}
+                    disabled={isCrawling}
                   />
                   <Label htmlFor="subdomains">Include Subdomains</Label>
                 </div>
-
                 <div className="flex items-center space-x-2">
                   <Switch
                     id="sitemaps"
                     checked={followSitemaps}
                     onCheckedChange={setFollowSitemaps}
-                    disabled={loading}
+                    disabled={isCrawling}
                   />
                   <Label htmlFor="sitemaps">Follow Sitemaps</Label>
                 </div>
-
                 <div className="flex items-center space-x-2">
-                  <Switch id="resumeCrawl" checked={resumeCrawl} onCheckedChange={setResumeCrawl} disabled={loading} />
+                  <Switch
+                    id="resumeCrawl"
+                    checked={resumeCrawl}
+                    onCheckedChange={setResumeCrawl}
+                    disabled={isCrawling}
+                  />
                   <Label htmlFor="resumeCrawl">Resume Crawl</Label>
                 </div>
               </div>
             </div>
           </form>
 
-          {/* Example URLs */}
           <div className="mt-4">
             <p className="text-sm text-gray-600 dark:text-gray-400 mb-2">Try comprehensive crawling on these sites:</p>
             <div className="flex flex-wrap gap-2">
@@ -262,7 +311,7 @@ export function ScraperDashboard() {
                   variant="outline"
                   size="sm"
                   onClick={() => setUrl(exampleUrl)}
-                  disabled={loading}
+                  disabled={isCrawling}
                   className="text-xs"
                 >
                   {new URL(exampleUrl).hostname}
@@ -282,16 +331,36 @@ export function ScraperDashboard() {
         </CardContent>
       </Card>
 
+      {isPolling && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <Loader2 className="h-5 w-5 animate-spin text-blue-500" />
+              Crawl in Progress: {pollingDomain}
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="flex items-center gap-4 p-4 bg-blue-50 dark:bg-blue-900/20 rounded-lg">
+              <Info className="h-5 w-5 text-blue-600" />
+              <p className="text-sm text-blue-700 dark:text-blue-300">
+                The crawl is running in the background. This page is polling for live updates every 5 seconds. You can
+                safely close this window; the crawl will continue.
+              </p>
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
       {crawlStatus && (
         <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
               {getStatusIcon(crawlStatus.status)}
-              Comprehensive Crawl Results: {crawlStatus.domain_name}
+              Crawl Status: {crawlStatus.domain_name}
             </CardTitle>
           </CardHeader>
           <CardContent>
-            <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
               <div>
                 <p className="text-sm text-gray-600 dark:text-gray-400">Status</p>
                 <Badge className={getStatusColor(crawlStatus.status)}>{crawlStatus.status}</Badge>
@@ -305,42 +374,29 @@ export function ScraperDashboard() {
                 <p className="font-semibold text-green-600">{crawlStatus.total_external_links}</p>
               </div>
               <div>
-                <p className="text-sm text-gray-600 dark:text-gray-400">Unique Domains</p>
-                <p className="font-semibold text-purple-600">{results?.domainSummary?.length || 0}</p>
-              </div>
-              <div>
-                <p className="text-sm text-gray-600 dark:text-gray-400">Sitemaps Found</p>
-                <p className="font-semibold">{crawlStatus.crawl_config?.sitemapsFound || 0}</p>
-              </div>
-            </div>
-            {results?.stats && (
-              <div className="mt-4 p-3 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded-md">
-                <p className="text-sm text-blue-700 dark:text-blue-300">
-                  🚀 Discovered {results.stats.totalUrls} total URLs • Crawled {results.stats.pagesCrawled} pages •
-                  Found {results.totalLinks} external links to {results.stats.domains} unique domains
-                  {crawlStatus.crawl_config?.sitemapsFound > 0 &&
-                    ` • Processed ${crawlStatus.crawl_config.sitemapsFound} sitemaps`}
+                <p className="text-sm text-gray-600 dark:text-gray-400">Last Update</p>
+                <p className="font-semibold text-gray-800 dark:text-gray-200">
+                  {new Date(crawlStatus.updated_at).toLocaleTimeString()}
                 </p>
               </div>
-            )}
+            </div>
           </CardContent>
         </Card>
       )}
 
-      {results && (
+      {results && crawlStatus?.status === "completed" && (
         <Card>
           <CardHeader>
             <CardTitle>Complete Website Analysis</CardTitle>
             <p className="text-sm text-gray-600 dark:text-gray-400">
-              Comprehensive crawl found {results.totalLinks} external links pointing to {results.domainSummary.length}{" "}
-              different domains
+              Comprehensive crawl found {results.totalLinks} external links.
             </p>
           </CardHeader>
           <CardContent>
             <Tabs defaultValue="links" className="w-full">
               <TabsList className="grid w-full grid-cols-2">
                 <TabsTrigger value="links">All External Links ({results.totalLinks})</TabsTrigger>
-                <TabsTrigger value="domains">Domain Analysis ({results.domainSummary.length})</TabsTrigger>
+                <TabsTrigger value="domains">Domain Analysis</TabsTrigger>
               </TabsList>
               <TabsContent value="links" className="space-y-4">
                 <PaginatedLinkTable domain={results.domain.domain_name} />

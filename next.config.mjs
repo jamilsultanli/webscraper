@@ -14,7 +14,7 @@ const nextConfig = {
   trailingSlash: false,
   // Ensure proper static file serving
   experimental: {
-    outputFileTracingRoot: undefined,
+    // Remove outputFileTracingRoot as it's not a valid option
   },
   // Add headers for static assets
   async headers() {

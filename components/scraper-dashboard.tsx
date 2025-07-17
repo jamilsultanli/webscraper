@@ -119,20 +119,34 @@ export function ScraperDashboard() {
       console.log("Dashboard: Response received", { status: response.status, ok: response.ok })
 
       if (!response.ok) {
-        // Try to get error message from response
+        // Read response as text first, then try to parse as JSON
         let errorMessage = "Failed to start crawl"
         try {
-          const errorData = await response.json()
-          errorMessage = errorData.error || errorMessage
+          const responseText = await response.text()
+          try {
+            const errorData = JSON.parse(responseText)
+            errorMessage = errorData.error || errorMessage
+          } catch {
+            // If JSON parsing fails, use the text response
+            errorMessage = responseText || errorMessage
+          }
         } catch {
-          // If JSON parsing fails, get text response
-          const errorText = await response.text()
-          errorMessage = errorText || errorMessage
+          // If reading text fails, use default message
+          errorMessage = `HTTP ${response.status}: ${response.statusText}`
         }
         throw new Error(errorMessage)
       }
 
-      const data = await response.json()
+      // For successful responses, also handle potential JSON parsing errors
+      let data
+      try {
+        const responseText = await response.text()
+        data = JSON.parse(responseText)
+      } catch (parseError) {
+        console.error("Dashboard: Failed to parse response JSON:", parseError)
+        throw new Error("Invalid response format from server")
+      }
+
       console.log("Dashboard: Crawl initiated successfully", data)
 
       // Crawl started successfully, begin polling

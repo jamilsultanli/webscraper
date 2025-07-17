@@ -42,36 +42,48 @@ export async function POST(request: NextRequest) {
     const sourceDomain = targetUrl.hostname.toLowerCase()
     console.log("Crawl API: Processing domain", { sourceDomain })
 
-    const client = await getDbClient()
+    console.log("Crawl API: Attempting to get DB client...")
+    const client = await getDbClient() // This is the first point of potential failure
+    console.log("Crawl API: DB client obtained.")
+
     let domainId: number
 
-    // If resuming, find the latest crawl. Otherwise, create a new one.
-    if (resume) {
-      const existingDomainResult = await client.query(
-        `SELECT id FROM domains WHERE domain_name = $1 ORDER BY id DESC LIMIT 1;`,
-        [sourceDomain],
-      )
-      if (existingDomainResult.rows.length > 0) {
-        domainId = existingDomainResult.rows[0].id
-        await client.query(`UPDATE domains SET status = 'processing', updated_at = NOW() WHERE id = $1;`, [domainId])
-        console.log(`Crawl API: Resuming crawl for domain ${sourceDomain} with ID: ${domainId}`)
+    try {
+      // If resuming, find the latest crawl. Otherwise, create a new one.
+      if (resume) {
+        console.log(`Crawl API: Checking for existing crawl for domain: ${sourceDomain}`)
+        const existingDomainResult = await client.query(
+          `SELECT id FROM domains WHERE domain_name = $1 ORDER BY id DESC LIMIT 1;`,
+          [sourceDomain],
+        )
+        if (existingDomainResult.rows.length > 0) {
+          domainId = existingDomainResult.rows[0].id
+          console.log(`Crawl API: Found existing crawl with ID: ${domainId}. Updating status to 'processing'.`)
+          await client.query(`UPDATE domains SET status = 'processing', updated_at = NOW() WHERE id = $1;`, [domainId])
+        } else {
+          console.log(`Crawl API: No existing crawl found for ${sourceDomain}. Inserting new domain record.`)
+          const newDomainResult = await client.query(
+            `INSERT INTO domains (domain_name, status, crawl_depth) VALUES ($1, 'processing', $2) RETURNING id;`,
+            [sourceDomain, depth],
+          )
+          domainId = newDomainResult.rows[0].id
+          console.log(`Crawl API: New domain record inserted with ID: ${domainId}`)
+        }
       } else {
-        // No crawl to resume, so create a new one
+        console.log(`Crawl API: Not resuming. Inserting new domain record for ${sourceDomain}.`)
         const newDomainResult = await client.query(
           `INSERT INTO domains (domain_name, status, crawl_depth) VALUES ($1, 'processing', $2) RETURNING id;`,
           [sourceDomain, depth],
         )
         domainId = newDomainResult.rows[0].id
-        console.log(`Crawl API: No crawl to resume. Starting new crawl for domain ${sourceDomain} with ID: ${domainId}`)
+        console.log(`Crawl API: New domain record inserted with ID: ${domainId}`)
       }
-    } else {
-      // Not resuming, so always create a new crawl record
-      const newDomainResult = await client.query(
-        `INSERT INTO domains (domain_name, status, crawl_depth) VALUES ($1, 'processing', $2) RETURNING id;`,
-        [sourceDomain, depth],
+    } catch (dbQueryError) {
+      console.error("Crawl API: Database query error during domain record handling:", dbQueryError)
+      // Re-throw to be caught by the main catch block and returned to client
+      throw new Error(
+        `Database operation failed: ${dbQueryError instanceof Error ? dbQueryError.message : String(dbQueryError)}`,
       )
-      domainId = newDomainResult.rows[0].id
-      console.log(`Crawl API: Starting new crawl for domain ${sourceDomain} with ID: ${domainId}`)
     }
 
     console.log("Crawl API: Creating crawler instance")
@@ -90,13 +102,16 @@ export async function POST(request: NextRequest) {
     // Fire-and-forget the crawl process.
     setImmediate(async () => {
       try {
+        console.log(`Background Crawl: Starting crawlWebsite for domain ID ${domainId}`)
         await crawler.crawlWebsite(url, resume)
+        console.log(`Background Crawl: crawlWebsite completed for domain ID ${domainId}`)
       } catch (e) {
         console.error(`Unhandled error in background crawl for domain ID ${domainId}:`, e)
         // Update status to failed
         try {
           const client = await getDbClient()
           await client.query(`UPDATE domains SET status = 'failed', updated_at = NOW() WHERE id = $1;`, [domainId])
+          console.log(`Background Crawl: Updated domain ID ${domainId} status to 'failed' due to unhandled error.`)
         } catch (dbError) {
           console.error(`Failed to update status to failed for domain ID ${domainId}:`, dbError)
         }
@@ -112,8 +127,11 @@ export async function POST(request: NextRequest) {
       crawl_id: domainId,
     })
   } catch (error) {
-    console.error("Crawl initiation API error:", error)
-    const errorMessage = error instanceof Error ? error.message : "Failed to initiate crawl"
+    console.error("Crawl initiation API error (caught in route handler):", error)
+    // Log the full error object for better debugging in Vercel logs
+    console.error("Full error object:", JSON.stringify(error, Object.getOwnPropertyNames(error)))
+
+    const errorMessage = error instanceof Error ? error.message : "An unknown error occurred during crawl initiation."
     return NextResponse.json({ error: errorMessage }, { status: 500 })
   }
 }

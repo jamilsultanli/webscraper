@@ -49,35 +49,13 @@ export async function POST(request: NextRequest) {
     let domainId: number
 
     try {
-      // If resuming, find the latest crawl. Otherwise, create a new one.
-      if (resume) {
-        console.log(`Crawl API: Checking for existing crawl for domain: ${sourceDomain}`)
-        const existingDomainResult = await client.query(
-          `SELECT id FROM domains WHERE domain_name = $1 ORDER BY id DESC LIMIT 1;`,
-          [sourceDomain],
-        )
-        if (existingDomainResult.rows.length > 0) {
-          domainId = existingDomainResult.rows[0].id
-          console.log(`Crawl API: Found existing crawl with ID: ${domainId}. Updating status to 'processing'.`)
-          await client.query(`UPDATE domains SET status = 'processing', updated_at = NOW() WHERE id = $1;`, [domainId])
-        } else {
-          console.log(`Crawl API: No existing crawl found for ${sourceDomain}. Inserting new domain record.`)
-          const newDomainResult = await client.query(
-            `INSERT INTO domains (domain_name, status, crawl_depth) VALUES ($1, 'processing', $2) RETURNING id;`,
-            [sourceDomain, depth],
-          )
-          domainId = newDomainResult.rows[0].id
-          console.log(`Crawl API: New domain record inserted with ID: ${domainId}`)
-        }
-      } else {
-        console.log(`Crawl API: Not resuming. Inserting new domain record for ${sourceDomain}.`)
-        const newDomainResult = await client.query(
-          `INSERT INTO domains (domain_name, status, crawl_depth) VALUES ($1, 'processing', $2) RETURNING id;`,
-          [sourceDomain, depth],
-        )
-        domainId = newDomainResult.rows[0].id
-        console.log(`Crawl API: New domain record inserted with ID: ${domainId}`)
-      }
+      console.log(`Crawl API: Inserting new domain record for ${sourceDomain}.`)
+      const newDomainResult = await client.query(
+        `INSERT INTO domains (domain_name, status, crawl_depth) VALUES ($1, 'processing', $2) RETURNING id;`,
+        [sourceDomain, depth],
+      )
+      domainId = newDomainResult.rows[0].id
+      console.log(`Crawl API: New domain record inserted with ID: ${domainId}`)
     } catch (dbQueryError) {
       console.error("Crawl API: Database query error during domain record handling:", dbQueryError)
       // Re-throw to be caught by the main catch block and returned to client

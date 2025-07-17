@@ -6,6 +6,11 @@ export const maxDuration = 60 // 60 seconds (maximum allowed)
 
 export async function POST(request: NextRequest) {
   try {
+    console.log("Crawl API: Starting request processing")
+
+    const body = await request.json()
+    console.log("Crawl API: Request body parsed", { url: body.url })
+
     const {
       url,
       depth = 3,
@@ -14,24 +19,29 @@ export async function POST(request: NextRequest) {
       includeSubdomains = true,
       followSitemaps = true,
       resume = false,
-    } = await request.json()
+    } = body
 
     if (!url) {
+      console.log("Crawl API: URL is required")
       return NextResponse.json({ error: "URL is required" }, { status: 400 })
     }
 
     let targetUrl: URL
     try {
       targetUrl = new URL(url)
-    } catch {
+    } catch (error) {
+      console.log("Crawl API: Invalid URL format", { url, error })
       return NextResponse.json({ error: "Invalid URL format" }, { status: 400 })
     }
 
     if (!["http:", "https:"].includes(targetUrl.protocol)) {
+      console.log("Crawl API: Unsupported protocol", { protocol: targetUrl.protocol })
       return NextResponse.json({ error: "Only HTTP and HTTPS URLs are supported" }, { status: 400 })
     }
 
     const sourceDomain = targetUrl.hostname.toLowerCase()
+    console.log("Crawl API: Processing domain", { sourceDomain })
+
     const client = await getDbClient()
     let domainId: number
 
@@ -44,7 +54,7 @@ export async function POST(request: NextRequest) {
       if (existingDomainResult.rows.length > 0) {
         domainId = existingDomainResult.rows[0].id
         await client.query(`UPDATE domains SET status = 'processing', updated_at = NOW() WHERE id = $1;`, [domainId])
-        console.log(`Resuming crawl for domain ${sourceDomain} with ID: ${domainId}`)
+        console.log(`Crawl API: Resuming crawl for domain ${sourceDomain} with ID: ${domainId}`)
       } else {
         // No crawl to resume, so create a new one
         const newDomainResult = await client.query(
@@ -52,7 +62,7 @@ export async function POST(request: NextRequest) {
           [sourceDomain, depth],
         )
         domainId = newDomainResult.rows[0].id
-        console.log(`No crawl to resume. Starting new crawl for domain ${sourceDomain} with ID: ${domainId}`)
+        console.log(`Crawl API: No crawl to resume. Starting new crawl for domain ${sourceDomain} with ID: ${domainId}`)
       }
     } else {
       // Not resuming, so always create a new crawl record
@@ -61,9 +71,10 @@ export async function POST(request: NextRequest) {
         [sourceDomain, depth],
       )
       domainId = newDomainResult.rows[0].id
-      console.log(`Starting new crawl for domain ${sourceDomain} with ID: ${domainId}`)
+      console.log(`Crawl API: Starting new crawl for domain ${sourceDomain} with ID: ${domainId}`)
     }
 
+    console.log("Crawl API: Creating crawler instance")
     const crawler = new ComprehensiveCrawler(
       {
         maxPages: Math.min(maxPages, 10000),
@@ -75,17 +86,24 @@ export async function POST(request: NextRequest) {
       domainId,
     )
 
+    console.log("Crawl API: Starting background crawl process")
     // Fire-and-forget the crawl process.
-    // The serverless function will continue running this in the background
-    // after the initial response has been sent.
-    // NOTE: This relies on your hosting environment (e.g., Google Cloud)
-    // allowing background execution after a response is sent.
-    ;(async () => {
-      await crawler.crawlWebsite(url, resume)
-    })().catch((e) => {
-      console.error(`Unhandled error in background crawl for domain ID ${domainId}:`, e)
+    setImmediate(async () => {
+      try {
+        await crawler.crawlWebsite(url, resume)
+      } catch (e) {
+        console.error(`Unhandled error in background crawl for domain ID ${domainId}:`, e)
+        // Update status to failed
+        try {
+          const client = await getDbClient()
+          await client.query(`UPDATE domains SET status = 'failed', updated_at = NOW() WHERE id = $1;`, [domainId])
+        } catch (dbError) {
+          console.error(`Failed to update status to failed for domain ID ${domainId}:`, dbError)
+        }
+      }
     })
 
+    console.log("Crawl API: Sending success response")
     // Immediately respond to the client to prevent timeout
     return NextResponse.json({
       success: true,

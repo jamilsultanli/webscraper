@@ -60,6 +60,8 @@ export class ComprehensiveCrawler {
   async crawlWebsite(startUrl: string, resume = false): Promise<void> {
     const startDomain = new URL(startUrl).hostname.toLowerCase()
     try {
+      console.log(`[Crawl ID: ${this.domainId}] Starting crawl for ${startDomain}`)
+
       let resumed = false
       if (resume) {
         resumed = await this.loadState(startDomain)
@@ -80,8 +82,12 @@ export class ComprehensiveCrawler {
       console.log(`[Crawl ID: ${this.domainId}] Crawl completed successfully.`)
     } catch (error) {
       console.error(`[Crawl ID: ${this.domainId}] Crawl failed with error:`, error)
-      const client = await getDbClient()
-      await client.query(`UPDATE domains SET status = 'failed', updated_at = NOW() WHERE id = $1;`, [this.domainId])
+      try {
+        const client = await getDbClient()
+        await client.query(`UPDATE domains SET status = 'failed', updated_at = NOW() WHERE id = $1;`, [this.domainId])
+      } catch (dbError) {
+        console.error(`[Crawl ID: ${this.domainId}] Failed to update status to failed:`, dbError)
+      }
     }
   }
 
@@ -113,11 +119,11 @@ export class ComprehensiveCrawler {
       if (result.rows.length === 0) return false
 
       const state: CrawlState = result.rows[0].state_data
-      this.discoveredUrls = new Set(state.discoveredUrls)
-      this.crawledUrls = new Set(state.crawledUrls)
-      this.urlQueue = state.urlQueue
-      this.robotsCache = new Map(state.robotsCache)
-      this.sitemapCache = new Map(state.sitemapCache)
+      this.discoveredUrls = new Set(state.discoveredUrls || [])
+      this.crawledUrls = new Set(state.crawledUrls || [])
+      this.urlQueue = state.urlQueue || []
+      this.robotsCache = new Map(state.robotsCache || [])
+      this.sitemapCache = new Map(state.sitemapCache || [])
       this.urlQueue.sort((a, b) => b.priority - a.priority)
       console.log(`[Crawl ID: ${this.domainId}] Crawl state loaded for ${domain}.`)
       return true
@@ -137,7 +143,6 @@ export class ComprehensiveCrawler {
   private async performComprehensiveCrawl(baseDomain: string): Promise<void> {
     let pagesCrawled = 0
     this.crawlErrors = 0
-    const saveInterval = 20 // Save state more frequently
 
     const worker = async (workerId: number) => {
       let batchLinks: any[] = []
@@ -167,16 +172,21 @@ export class ComprehensiveCrawler {
 
           // Update stats in DB periodically
           if (pagesCrawled % 10 === 0) {
-            const client = await getDbClient()
-            await client.query(`UPDATE domains SET total_pages_crawled = $1, updated_at = NOW() WHERE id = $2;`, [
-              this.crawledUrls.size,
-              this.domainId,
-            ])
+            try {
+              const client = await getDbClient()
+              await client.query(`UPDATE domains SET total_pages_crawled = $1, updated_at = NOW() WHERE id = $2;`, [
+                this.crawledUrls.size,
+                this.domainId,
+              ])
+            } catch (error) {
+              console.error(`[Crawl ID: ${this.domainId}] Failed to update crawl stats:`, error)
+            }
           }
 
           await new Promise((resolve) => setTimeout(resolve, this.config.crawlDelay))
         } catch (error) {
           this.crawlErrors++
+          console.error(`[Crawl ID: ${this.domainId}] Error crawling ${url}:`, error)
         }
       }
       // Save any remaining links in the batch
@@ -190,20 +200,25 @@ export class ComprehensiveCrawler {
 
     // Final state save and stats update
     await this.saveState(baseDomain)
-    const client = await getDbClient()
-    const totalLinksResult = await client.query(`SELECT COUNT(*) FROM outgoing_links WHERE domain_id = $1;`, [
-      this.domainId,
-    ])
-    await client.query(
-      `UPDATE domains SET total_pages_crawled = $1, total_external_links = $2, updated_at = NOW() WHERE id = $3;`,
-      [this.crawledUrls.size, totalLinksResult.rows[0].count, this.domainId],
-    )
+    try {
+      const client = await getDbClient()
+      const totalLinksResult = await client.query(`SELECT COUNT(*) FROM outgoing_links WHERE domain_id = $1;`, [
+        this.domainId,
+      ])
+      await client.query(
+        `UPDATE domains SET total_pages_crawled = $1, total_external_links = $2, updated_at = NOW() WHERE id = $3;`,
+        [this.crawledUrls.size, totalLinksResult.rows[0].count, this.domainId],
+      )
+    } catch (error) {
+      console.error(`[Crawl ID: ${this.domainId}] Failed to update final stats:`, error)
+    }
   }
 
   private async _saveBatchToDb(links: any[]) {
     if (links.length === 0) return
-    const client = await getDbClient()
     try {
+      const client = await getDbClient()
+
       // Bulk insert links
       const values = links
         .map(
@@ -242,24 +257,25 @@ export class ComprehensiveCrawler {
     }
   }
 
-  // --- Other methods (discoverFromSitemaps, crawlPage, etc.) remain largely the same but can be simplified ---
-  // For brevity, I'm showing the core logic changes. The existing helper methods for discovery can be reused.
-  // The key change is that `allLinks` is no longer a class property holding all links.
-
   private async discoverFromSitemaps(startUrl: string, domain: string) {
     const sitemapUrls = [`${new URL(startUrl).origin}/sitemap.xml`, `${new URL(startUrl).origin}/sitemap_index.xml`]
     for (const sitemapUrl of sitemapUrls) {
       try {
         const urls = await this.parseSitemap(sitemapUrl)
         urls.forEach((url) => this.shouldCrawlUrl(url, domain) && this.addUrlToQueue(url, 1, "sitemap", "sitemap", 8))
-      } catch (error) {}
+      } catch (error) {
+        console.error(`[Crawl ID: ${this.domainId}] Error parsing sitemap ${sitemapUrl}:`, error)
+      }
     }
   }
 
   private async parseSitemap(sitemapUrl: string): Promise<string[]> {
     if (this.sitemapCache.has(sitemapUrl)) return this.sitemapCache.get(sitemapUrl)!
     try {
-      const response = await fetch(sitemapUrl, { headers: { "User-Agent": this.config.userAgent } })
+      const response = await fetch(sitemapUrl, {
+        headers: { "User-Agent": this.config.userAgent },
+        signal: AbortSignal.timeout(10000), // 10 second timeout
+      })
       if (!response.ok) return []
       const xml = await response.text()
       const urls: string[] = []
@@ -275,6 +291,7 @@ export class ComprehensiveCrawler {
       this.sitemapCache.set(sitemapUrl, urls)
       return urls
     } catch (error) {
+      console.error(`[Crawl ID: ${this.domainId}] Error fetching sitemap ${sitemapUrl}:`, error)
       return []
     }
   }
@@ -282,7 +299,10 @@ export class ComprehensiveCrawler {
   private async discoverFromRobots(startUrl: string, domain: string) {
     try {
       const robotsUrl = `${new URL(startUrl).origin}/robots.txt`
-      const response = await fetch(robotsUrl, { headers: { "User-Agent": this.config.userAgent } })
+      const response = await fetch(robotsUrl, {
+        headers: { "User-Agent": this.config.userAgent },
+        signal: AbortSignal.timeout(10000), // 10 second timeout
+      })
       if (!response.ok) return
       const robotsText = await response.text()
       const sitemapMatches = robotsText.match(/Sitemap:\s*(.*)/gi) || []
@@ -292,7 +312,9 @@ export class ComprehensiveCrawler {
         urls.forEach((url) => this.shouldCrawlUrl(url, domain) && this.addUrlToQueue(url, 1, "robots", "sitemap", 8))
       }
       this.robotsCache.set(domain, robotsText)
-    } catch (error) {}
+    } catch (error) {
+      console.error(`[Crawl ID: ${this.domainId}] Error fetching robots.txt:`, error)
+    }
   }
 
   private shouldCrawlUrl(url: string, baseDomain: string): boolean {
@@ -311,19 +333,28 @@ export class ComprehensiveCrawler {
   private async crawlPage(url: string, baseDomain: string): Promise<{ links: any[]; html: string; finalUrl: string }> {
     const controller = new AbortController()
     const timeoutId = setTimeout(() => controller.abort(), 30000)
-    const response = await fetch(url, {
-      headers: { "User-Agent": this.config.userAgent },
-      signal: controller.signal,
-      redirect: "follow",
-    })
-    clearTimeout(timeoutId)
-    if (!response.ok) throw new Error(`HTTP ${response.status}`)
-    const contentType = response.headers.get("content-type") || ""
-    if (!contentType.includes("text/html")) return { links: [], html: "", finalUrl: response.url }
-    const html = await response.text()
-    const finalUrl = response.url
-    const links = this.extractExternalLinks(html, finalUrl, baseDomain)
-    return { links, html, finalUrl }
+
+    try {
+      const response = await fetch(url, {
+        headers: { "User-Agent": this.config.userAgent },
+        signal: controller.signal,
+        redirect: "follow",
+      })
+      clearTimeout(timeoutId)
+
+      if (!response.ok) throw new Error(`HTTP ${response.status}`)
+
+      const contentType = response.headers.get("content-type") || ""
+      if (!contentType.includes("text/html")) return { links: [], html: "", finalUrl: response.url }
+
+      const html = await response.text()
+      const finalUrl = response.url
+      const links = this.extractExternalLinks(html, finalUrl, baseDomain)
+      return { links, html, finalUrl }
+    } catch (error) {
+      clearTimeout(timeoutId)
+      throw error
+    }
   }
 
   private async discoverUrlsFromPage(currentUrl: string, html: string, baseDomain: string, currentDepth: number) {
@@ -337,7 +368,9 @@ export class ComprehensiveCrawler {
         if (this.shouldCrawlUrl(absoluteUrl, baseDomain)) {
           this.addUrlToQueue(absoluteUrl, currentDepth + 1, currentUrl, "internal", 5)
         }
-      } catch (error) {}
+      } catch (error) {
+        // Ignore invalid URLs
+      }
     }
   }
 
@@ -371,7 +404,9 @@ export class ComprehensiveCrawler {
           })
           seenUrls.add(absoluteUrl)
         }
-      } catch (error) {}
+      } catch (error) {
+        // Ignore invalid URLs
+      }
     }
     return links
   }

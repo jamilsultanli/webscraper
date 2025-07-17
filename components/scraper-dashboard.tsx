@@ -101,6 +101,7 @@ export function ScraperDashboard() {
     setPollingDomain(null)
 
     try {
+      console.log("Dashboard: Starting crawl request")
       const response = await fetch("/api/crawl-website", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -115,11 +116,24 @@ export function ScraperDashboard() {
         }),
       })
 
-      const data = await response.json()
+      console.log("Dashboard: Response received", { status: response.status, ok: response.ok })
 
       if (!response.ok) {
-        throw new Error(data.error || "Failed to start crawl")
+        // Try to get error message from response
+        let errorMessage = "Failed to start crawl"
+        try {
+          const errorData = await response.json()
+          errorMessage = errorData.error || errorMessage
+        } catch {
+          // If JSON parsing fails, get text response
+          const errorText = await response.text()
+          errorMessage = errorText || errorMessage
+        }
+        throw new Error(errorMessage)
       }
+
+      const data = await response.json()
+      console.log("Dashboard: Crawl initiated successfully", data)
 
       // Crawl started successfully, begin polling
       setPollingDomain(data.domain_name)
@@ -136,7 +150,7 @@ export function ScraperDashboard() {
         updated_at: new Date().toISOString(),
       })
     } catch (err) {
-      console.error("Crawl initiation error:", err)
+      console.error("Dashboard: Crawl initiation error:", err)
       setError(err instanceof Error ? err.message : "An error occurred")
       setLoading(false)
     }
